@@ -1109,6 +1109,46 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             post_iter_func=lambda x: x[1],
         )
 
+    # ------------------------------------------------------------------
+    # rlix integration: CPU bucket cache support
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def get_cpu_weight_shards(self) -> dict[str, torch.Tensor]:
+        """Export model weights to CPU in HF format for rlix bucket cache.
+
+        Internally calls ``megatron_bridge.export_hf_weights`` which handles
+        PP collective gather across all pipeline-parallel ranks.  Only the
+        cache owner (pp_rank==0 / dp_rank==0 / tp_rank==0) receives the full
+        parameter set; other ranks return an empty dict (they participate in
+        the collective but discard results).
+
+        The returned tensors are on CPU and contiguous.  The caller (rlix
+        ``ModelUpdateServiceCached``) is responsible for storing them in the
+        ``CPUBucketCache`` and tracking the dirty/clean state.
+
+        Returns:
+            ``{hf_param_name: cpu_tensor}`` for the cache owner, ``{}`` for
+            all other ranks.
+        """
+        self.prepare_refit_info()
+        result: dict[str, torch.Tensor] = {}
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            result[name] = tensor.detach().cpu().contiguous()
+        return result
+
+    def promote_active_checkpoint(self, version: int) -> None:
+        """Mark *version* as the active checkpoint ready for inference sync.
+
+        Called by ``BucketCacheLifecycle.promote()`` in the rlix pipeline
+        after ``get_cpu_weight_shards`` has been stored in the CPU cache.
+        Non-owner ranks return immediately (no-op).
+
+        Args:
+            version: Training step number that produced the cached weights.
+        """
+        self._rlix_active_checkpoint_version: int = int(version)
+
     def prepare_for_lp_inference(self):
         self.model = self.move_model(self.model, "cuda", move_grads=False)
         self.model.eval()
