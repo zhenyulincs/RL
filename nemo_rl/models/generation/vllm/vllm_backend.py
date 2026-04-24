@@ -363,39 +363,82 @@ class VllmInternalWorkerExtension:
         payload: dict,
         ipc_local_ranks: list[int],
         model_update_transport: str,
+        is_lora: bool = False,
     ) -> None:
         """Receive a packed weight bucket and load it into the model.
 
-        Reuses the IPC/cpu_serialize weight-loading logic from
-        ``update_weights_via_ipc_zmq`` (vllm_backend.py:193–229).
+        Two transport modes (spec: nemorl-port-plan.md lines 316-323, 344-345):
+
+        ``"cpu_serialize"`` — payload contains ``cpu_uint8_bucket`` (CPU uint8 tensor).
+            DMA copies the buffer to GPU, then unpacks per-param tensors.
+            Used for cross-GPU or containerized deployments where CUDA IPC is unavailable.
+
+        ``"cuda_ipc"`` — payload contains ``cuda_ipc_handle`` (CUDA IPC handle tuple).
+            Rebuilds the GPU tensor directly via ``rebuild_cuda_tensor_from_ipc()``
+            (zero-copy for same-physical-GPU colocated processes).
+            Required when sender and receiver share a physical GPU; NCCL cannot
+            form a group between two ranks on the same GPU (spec line 316).
 
         Args:
-            payload: Dict with keys ``param_names``, ``shapes``, ``dtypes``,
-                ``offsets``, ``used_bytes``, ``cpu_uint8_bucket``.
+            payload: Transport dict. cpu_serialize: keys ``param_names``, ``shapes``,
+                ``dtypes``, ``offsets``, ``used_bytes``, ``cpu_uint8_bucket``.
+                cuda_ipc: same keys but ``cuda_ipc_handle`` instead of ``cpu_uint8_bucket``.
             ipc_local_ranks: Infer-local ranks that should process this bucket.
-                Ranks not in this list return immediately (guard).
-            model_update_transport: ``"cpu_serialize"`` (only mode supported).
+            model_update_transport: ``"cpu_serialize"`` or ``"cuda_ipc"``.
+            is_lora: Reserved for LoRA adapter weights (not yet used).
         """
-        local_rank = (
-            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        )
+        # Use the vLLM worker's own rank, not the distributed process-group rank.
+        # ipc_local_ranks contains LOCAL ranks within the worker (comm-plan contract,
+        # spec nemorl-port-plan.md:406-412); torch.distributed.get_rank() would be
+        # the wrong identity in multi-node setups. (Matches ROLL worker.py:757.)
+        local_rank = getattr(self, "rank", None)
+        if local_rank is None:
+            # Fallback for workers that don't expose .rank — use distributed rank.
+            local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if local_rank not in ipc_local_ranks:
             return
 
-        param_names: list[str] = payload["param_names"]
-        shapes: list = payload["shapes"]
-        dtypes: list = payload["dtypes"]
-        offsets: list[int] = payload["offsets"]
-        buf: torch.Tensor = payload["cpu_uint8_bucket"].to(self.device)
+        from rlix.pipeline.bucket_cache import BucketRecord, unpack_bucket_record
 
-        weights = []
-        for name, shape, dtype, offset in zip(param_names, shapes, dtypes, offsets):
-            num_elements = 1
-            for s in shape:
-                num_elements *= s
-            nbytes = num_elements * torch.empty(0, dtype=dtype).element_size()
-            flat = buf[offset : offset + nbytes].view(dtype)
-            weights.append((name, flat.reshape(shape)))
+        # --- Reconstruct named tensors from transport payload ---
+        if model_update_transport == "cuda_ipc":
+            # Zero-copy: sender and receiver share the same physical GPU.
+            # Rebuild GPU tensor from IPC handle — no CPU roundtrip.
+            # Spec line 316: NCCL cannot form a group on the same GPU; IPC is required.
+            from torch.multiprocessing.reductions import rebuild_cuda_tensor
+            device_id = self.device.index if hasattr(self.device, "index") else 0
+            ipc_args = list(payload["cuda_ipc_handle"][0])
+            ipc_args[6] = device_id  # patch device index
+            buf_gpu = rebuild_cuda_tensor(*ipc_args)
+            torch.cuda.current_stream().synchronize()
+
+            # Reconstruct named tensors directly from GPU buffer (no CPU copy)
+            weights = []
+            for name, shape, dtype, offset in zip(
+                payload["param_names"], payload["shapes"],
+                payload["dtypes"], payload["offsets"]
+            ):
+                num_elements = 1
+                for s in shape:
+                    num_elements *= s
+                nbytes = num_elements * torch.empty(0, dtype=dtype).element_size()
+                flat = buf_gpu[offset : offset + nbytes].view(dtype)
+                weights.append((name, flat.reshape(shape)))
+        else:
+            # cpu_serialize: DMA copy pinned CPU buffer → GPU, then unpack
+            buf_gpu = payload["cpu_uint8_bucket"].pin_memory().to(self.device, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+
+            record = BucketRecord(
+                param_names=payload["param_names"],
+                shapes=payload["shapes"],
+                dtypes=payload["dtypes"],
+                offsets=payload["offsets"],
+                used_bytes=payload["used_bytes"],
+                cpu_uint8_bucket=buf_gpu.cpu(),
+            )
+            named_tensors = unpack_bucket_record(record)
+            weights = [(name, t.to(self.device)) for name, t in named_tensors]
 
         from nemo_rl.models.generation.vllm.quantization import fp8
 
@@ -406,7 +449,7 @@ class VllmInternalWorkerExtension:
             self.model_runner.model.load_weights(weights=policy_weights)
         self._load_draft_weights(draft_weights)
         torch.cuda.current_stream().synchronize()
-        del buf, weights, policy_weights, draft_weights
+        del buf_gpu, weights, policy_weights, draft_weights
 
     def broadcast_parameter(
         self,
@@ -415,6 +458,7 @@ class VllmInternalWorkerExtension:
         dtypes: list,
         shapes: list,
         broadcast_local_ranks: list[int],
+        is_lora: bool = False,
     ) -> None:
         """Receive a packed NCCL broadcast and load weights into the model.
 
@@ -428,6 +472,8 @@ class VllmInternalWorkerExtension:
             shapes: Per-param shapes.
             broadcast_local_ranks: Infer-local ranks that participate.
                 Ranks not in this list return immediately (guard).
+            is_lora: If True, payload contains LoRA adapter weights (reserved,
+                not yet used — base weights always use False).
         """
         if not hasattr(self, "_model_update_groups"):
             return
