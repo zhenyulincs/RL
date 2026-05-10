@@ -854,6 +854,12 @@ class VllmGeneration(GenerationInterface):
     # ------------------------------------------------------------------
     # rlix integration: selective sync receiver pass-throughs (Feature 4)
     # ------------------------------------------------------------------
+    #
+    # Every receiver pass-through below MUST dispatch to ALL TP/PP ranks
+    # (run_rank_0_only_axes=[]). NCCL collectives require every
+    # participating rank to call init_process_group / join the group; if
+    # we filter to TP rank 0 only, ranks 1..N-1 never join → all
+    # subsequent collectives (broadcast, finalize) deadlock or assert.
 
     def setup_collective_group(
         self,
@@ -873,7 +879,7 @@ class VllmGeneration(GenerationInterface):
             comm_plan=comm_plan,
             mode=mode,
             timeout_s=timeout_s,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
@@ -895,7 +901,7 @@ class VllmGeneration(GenerationInterface):
             ipc_local_ranks=ipc_local_ranks,
             model_update_transport=model_update_transport,
             is_lora=is_lora,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
@@ -921,7 +927,7 @@ class VllmGeneration(GenerationInterface):
             shapes=shapes,
             broadcast_local_ranks=broadcast_local_ranks,
             is_lora=is_lora,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
@@ -934,7 +940,7 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "destroy_collective_group",
             group_name=group_name,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
@@ -944,7 +950,7 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             "verify_model",
             expected_stats=expected_stats,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
@@ -956,7 +962,7 @@ class VllmGeneration(GenerationInterface):
         """
         futures = self.worker_group.run_all_workers_single_data(
             "finalize_weight_update",
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            run_rank_0_only_axes=[],
         )
         if futures:
             ray.get(futures)
