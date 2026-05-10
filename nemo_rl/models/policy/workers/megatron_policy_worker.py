@@ -1395,8 +1395,16 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                     # NCCL broadcast path: cross-GPU workers.
                     if group_name in self._rlix_model_update_groups:
                         nccl_group = self._rlix_model_update_groups[group_name]
-                        dist.broadcast(staging_buf, src=0, group=nccl_group)
 
+                        # Dispatch receiver .remote() calls FIRST, so the
+                        # actor scheduler queues them BEFORE this worker
+                        # blocks on the collective. dist.broadcast() is a
+                        # synchronous NCCL collective — it pins the Python
+                        # thread until every participating rank arrives.
+                        # If we issued .remote() after, the sender thread
+                        # would already be blocked, .remote() would never
+                        # submit, and receivers would never join the
+                        # collective → deadlock.
                         for dp_rank, broadcast_local_ranks in broadcast_local_ranks_by_dp_rank.items():
                             recv_refs.append(
                                 dp_rank_to_worker[int(dp_rank)].broadcast_parameter.remote(
@@ -1407,6 +1415,11 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                                     broadcast_local_ranks,
                                 )
                             )
+
+                        # Now enter the collective. Receivers' broadcast_parameter
+                        # implementations call group.broadcast(recv_buf, src=0)
+                        # and rendezvous with this call.
+                        dist.broadcast(staging_buf, src=0, group=nccl_group)
 
                     import ray as _ray
                     _ray.get(recv_refs)
