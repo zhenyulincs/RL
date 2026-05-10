@@ -243,11 +243,17 @@ def test_selective_sync_dispatch_ordering_lexical():
     """Lexical guard: in selective_sync_active_cache, the
     broadcast_parameter.remote(...) dispatch loop appears BEFORE the
     sender-side dist.broadcast(...) call within the NCCL-broadcast
-    branch."""
-    from pathlib import Path
-    import nemo_rl.models.policy.workers.megatron_policy_worker as mod
+    branch.
 
-    src_path = Path(mod.__file__)
+    Reads the source file directly via Path (no Python import) so the
+    test does not pull in megatron / megatron_bridge dependencies that
+    may not be present on every CI image.
+    """
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[4]
+    src_path = repo_root / "nemo_rl" / "models" / "policy" / "workers" / "megatron_policy_worker.py"
+    assert src_path.is_file(), f"could not locate {src_path}"
     text = src_path.read_text()
 
     # Find the NCCL-broadcast branch; assert dispatch loop comes before
