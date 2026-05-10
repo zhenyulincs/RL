@@ -480,9 +480,17 @@ class VllmInternalWorkerExtension:
         if group_name not in self._model_update_groups:
             return
 
-        local_rank = (
-            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        )
+        # Use the vLLM worker's own local rank (same convention as
+        # update_parameter_in_bucket above). torch.distributed.get_rank()
+        # returns the global rank in WORLD; broadcast_local_ranks carries
+        # LOCAL ranks within the worker, so under TP>1 / multi-node the
+        # global rank never matches and every receiver silently
+        # early-returns.
+        local_rank = getattr(self, "rank", None)
+        if local_rank is None:
+            local_rank = (
+                torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            )
         if local_rank not in broadcast_local_ranks:
             return
 
